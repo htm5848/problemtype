@@ -5,9 +5,11 @@ Sister tool to the PHYS 211 TA Observation Tool. The NetID screen and the
 observation date, number of tables) are identical. The observation page is a
 full classroom map for coding student interaction.
 
+**Live site:** https://htm5848.github.io/problemtype/
+
 ## Run it
-- Open `index.html` in a browser, or
-- host the folder on GitHub Pages as its own repo (e.g. `TAcoding`), like the original.
+- Use the live site above (works on iPad, phone and laptop), or
+- open `index.html` in a browser. Pushing to `main` updates the live site through GitHub Pages in about a minute.
 
 No backend. Work autosaves to the device so an accidental reload can be resumed.
 
