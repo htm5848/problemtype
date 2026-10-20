@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PHYS 211 Group-Work Coding Tool — UIUC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2313294B'/%3E%3Ccircle cx='16' cy='16' r='5' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     SCREEN 1 — NetID entry (same as the TA observation tool)
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="screen" id="screen-netid">
+  <div class="auth-card">
+    <div class="auth-logo">
+      <div class="logo-mark">
+        <svg viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="9" cy="9" r="3" fill="white"/>
+          <path d="M9 2v2M9 14v2M2 9h2M14 9h2M4.22 4.22l1.42 1.42M12.36 12.36l1.42 1.42M4.22 13.78l1.42-1.42M12.36 5.64l1.42-1.42" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="auth-title">PHYS 211 Group-Work Coding Tool</div>
+      <div class="auth-sub">Student interaction observation · UIUC</div>
+    </div>
+
+    <label class="form-label" for="netid-input">Your UIUC NetID</label>
+    <input type="text" id="netid-input" class="form-input big" placeholder="e.g. jsmith23" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <div class="auth-hint">No password needed — your NetID is used only to label your observation records.</div>
+    <div class="auth-error hidden" id="netid-error">Please enter your NetID to continue.</div>
+    <button class="btn-primary big" onclick="submitNetID()">Continue →</button>
+
+    <div class="auth-footer">
+      Not a mentor TA doing an observation? This tool is for classroom-observation research only.
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     SCREEN 2 — Session setup (same fields as the TA observation tool)
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="screen hidden" id="screen-setup">
+  <div class="setup-card">
+    <div class="setup-header">
+      <div>
+        <div class="setup-eyebrow" id="setup-observer-label">Observer: —</div>
+        <h1>New observation</h1>
+        <p>Set up the session before you start watching the discussion.</p>
+      </div>
+      <button class="link-btn" onclick="switchUser()">Not you? Switch NetID</button>
+    </div>
+
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="form-label">Discussion section</label>
+        <select id="setup-section" class="form-input" onchange="onSectionChange()">
+          <option value="">Select a section…</option>
+        </select>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">TA being observed</label>
+        <input type="text" id="setup-ta-name" class="form-input" placeholder="Auto-fills from section" readonly>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">Observation date</label>
+        <input type="date" id="setup-date" class="form-input">
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">Number of tables in room</label>
+        <div class="stepper">
+          <button type="button" class="stepper-btn" onclick="stepTables(-1)">−</button>
+          <input type="number" id="setup-table-count" class="stepper-input" value="6" min="2" max="16" readonly>
+          <button type="button" class="stepper-btn" onclick="stepTables(1)">+</button>
+        </div>
+        <div class="field-hint">Typical PHYS 211 rooms have 6–8 tables. Adjust up or down to match this room.</div>
+      </div>
+    </div>
+
+    <div class="setup-notice" id="setup-warning" style="display:none;"></div>
+
+    <button class="btn-primary big" onclick="startObservation()">Start observation →</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     SCREEN 3 — Classroom map + coding panel
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="screen hidden" id="screen-observe">
+
+  <div class="obs-topbar">
+    <div class="obs-topbar-info">
+      <div class="obs-topbar-title" id="obs-title">D2A · Grant Gallier</div>
+      <div class="obs-topbar-sub" id="obs-sub">Observer jsmith23 · Sep 17, 2026</div>
+    </div>
+    <div class="phase-wrap">
+      <span class="phase-label">Activity</span>
+      <div class="obs-tabs" id="phase-tabs">
+        <button class="obs-tab" data-phase="Structured" onclick="setPhase('Structured')">Structured</button>
+        <button class="obs-tab" data-phase="Open-ended" onclick="setPhase('Open-ended')">Open-ended</button>
+        <button class="obs-tab" data-phase="Other" onclick="setPhase('Other')">Other</button>
+      </div>
+    </div>
+    <div class="obs-timer-wrap">
+      <div class="obs-timer" id="obs-timer">00:00</div>
+    </div>
+    <button class="btn-end" onclick="endObservation()">End &amp; Export</button>
+  </div>
+
+  <div class="obs-body" id="obs-body">
+    <div class="map-col">
+      <div class="map-toolbar">
+        <div class="legend" id="legend"></div>
+        <div class="table-controls">
+          <button type="button" class="tbl-btn" onclick="stepTablesLive(-1)" aria-label="Remove a table">−</button>
+          <span class="tbl-count"><input type="number" id="map-table-count" value="6" min="2" max="16" readonly> tables</span>
+          <button type="button" class="tbl-btn add" onclick="stepTablesLive(1)">+ Add table</button>
+        </div>
+      </div>
+
+      <div class="room" id="room">
+        <div class="map-front-label" id="front-strip" onclick="logTAFront(event)" role="button" aria-label="TA is at the front of the room"><span>FRONT OF ROOM / BOARD</span></div>
+        <div class="room-grid" id="room-grid"></div>
+      </div>
+
+      <div class="live-log" id="live-log">
+        <div class="ll-head">
+          <button type="button" class="ll-toggle" id="ll-toggle" onclick="toggleLog()" aria-expanded="true">▾ Live log</button>
+          <span class="log-summary" id="log-summary">0 codes</span>
+          <span class="ta-status" id="ta-status">TA position not marked yet</span>
+          <button class="mini-btn" onclick="undoLast()">Undo last</button>
+        </div>
+        <div class="ll-body" id="ll-body"></div>
+      </div>
+    </div>
+
+    <aside class="side-panel" id="side-panel" aria-live="polite"></aside>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     SCREEN 4 — Done / export
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="screen hidden" id="screen-done">
+  <div class="auth-card">
+    <div class="done-check">
+      <svg width="28" height="28" viewBox="0 0 16 16" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="M2 8l4 4 8-8"/></svg>
+    </div>
+    <div class="auth-title">Observation complete</div>
+    <div class="auth-sub" id="done-summary">—</div>
+
+    <button class="btn-primary big" onclick="downloadCSVAgain()">⬇ Download CSV</button>
+    <div class="done-ios-note hidden" id="done-ios-note">On iPad, the CSV downloads first — tap the button below to save the PDF report too.</div>
+    <button class="btn-secondary big" id="done-report-btn" onclick="downloadReportAgain()">⬇ Download participation report (PDF)</button>
+    <button class="btn-secondary big" onclick="newObservation()">Start another observation</button>
+
+    <div class="auth-footer">
+      The CSV has every timestamped code and note plus per-student, per-table and per-activity numbers. The PDF report compares each table's participation during structured vs. open-ended activities, and whether students collaborated more with the TA at their table. Save it to your Files app or email it to the research coordinator.
+    </div>
+  </div>
+</div>
+
+<script src="js/vendor/jspdf.umd.min.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
