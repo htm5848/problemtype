@@ -123,7 +123,10 @@
         </div>
       </div>
 
+      <div class="rot-bar idle" id="rot-bar" aria-live="polite"></div>
+
       <div class="room" id="room">
+        <div class="rot-banner" id="rot-banner" role="status"></div>
         <div class="map-front-label" id="front-strip" onclick="logTAFront(event)" role="button" aria-label="TA is at the front of the room"><span>FRONT OF ROOM / BOARD</span></div>
         <div class="room-grid" id="room-grid"></div>
       </div>
@@ -160,7 +163,7 @@
     <button class="btn-secondary big" onclick="newObservation()">Start another observation</button>
 
     <div class="auth-footer">
-      The CSV has every timestamped code and note plus per-student, per-table and per-activity numbers. The PDF report compares each table's participation during structured vs. open-ended activities, and whether students collaborated more with the TA at their table. Save it to your Files app or email it to the research coordinator.
+      The CSV has every 1-minute table chunk, one observation per student per chunk, every timestamped code and note, and per-student, per-table and per-activity numbers. The PDF report compares each table's participation during structured vs. open-ended activities, and whether students collaborated more with the TA at their table. Save it to your Files app or email it to the research coordinator.
     </div>
   </div>
 </div>
