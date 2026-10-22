@@ -294,7 +294,9 @@ function setPhase(p) {
   obsSession.phaseLog.push({ elapsedSec: now, phase: next, ord: ++obsSession.seq });
   obsSession.phaseStartIdx = obsSession.log.length;
   if (next) startChunk(obsSession.tables[0].id, now);   // every activity starts a fresh rotation at Table 1
+  showEarlierLog = false;
   renderPhase();
+  renderTAMarker();
   afterRotate(next ? `${next}: start at Table ${obsSession.tables[0].id}` : "");
 }
 
@@ -579,8 +581,15 @@ function lastCodeEntry(id) {
   return null;
 }
 
+/* Each activity is a blank slate on screen: the map, TA marker, live log and
+   panel only show what was logged in the CURRENT activity round. Earlier
+   rounds stay saved and go into the exports. */
+const curRound = () => obsSession.phaseLog.length - 1;
+const inCurrentRound = e => segIndexOf(obsSession, e) === curRound();
+function roundEnd(s, i) { return i + 1 < s.phaseLog.length ? s.phaseLog[i + 1].elapsedSec : s.totalSeconds; }
+
 function hasNote(id) {
-  return obsSession.log.some(e => e.kind === "note" && e.sid === id);
+  return obsSession.log.some(e => e.kind === "note" && e.sid === id && inCurrentRound(e));
 }
 
 function agoText(id) {
@@ -623,9 +632,13 @@ function updateSeatStates() {
    mark the TA there; tap the front strip for the front of the room. The TA
    stays at the last marked spot until the next tap — across activity
    switches too, since it is where the TA physically is. */
+/* The TA's position is marked afresh in each activity (blank slate). */
 function currentTA() {
   if (!obsSession) return null;
-  for (let i = obsSession.log.length - 1; i >= 0; i--) if (obsSession.log[i].kind === "ta") return obsSession.log[i];
+  for (let i = obsSession.log.length - 1; i >= 0; i--) {
+    const e = obsSession.log[i];
+    if (e.kind === "ta" && inCurrentRound(e)) return e;
+  }
   return null;
 }
 
@@ -654,7 +667,7 @@ function logTAFront(e) {
 function renderTAMarker(flash) {
   document.querySelectorAll(".ta-marker, .ta-dot").forEach(m => m.remove());
   // Earlier TA positions stay on the map as small numbered dots
-  const marks = obsSession ? obsSession.log.filter(e => e.kind === "ta") : [];
+  const marks = obsSession ? obsSession.log.filter(e => e.kind === "ta" && inCurrentRound(e)) : [];
   marks.slice(0, -1).forEach((m, i) => {
     const h = m.table == null ? $("front-strip") : document.querySelector(`.tbl-cell[data-table="${m.table}"]`);
     if (!h) return;
@@ -668,7 +681,7 @@ function renderTAMarker(flash) {
   document.querySelectorAll(".tbl-cell.ta-here, .map-front-label.ta-here").forEach(c => c.classList.remove("ta-here"));
   const ta = currentTA();
   const st = $("ta-status");
-  if (!ta) { if (st) st.textContent = "TA position not marked yet"; return; }
+  if (!ta) { if (st) st.textContent = curRound() > 0 ? "TA position not marked yet in this activity" : "TA position not marked yet"; return; }
   const host = ta.table == null ? $("front-strip") : document.querySelector(`.tbl-cell[data-table="${ta.table}"]`);
   if (st) st.textContent = `TA: ${ta.place} since ${formatTime(ta.elapsedSec)}`;
   if (!host) return;
@@ -753,7 +766,8 @@ function renderPanel() {
     const { table, seat } = selection;
     const id = sid(table, seat);
     const last = lastCodeEntry(id);
-    const entries = obsSession.log.filter(e => e.sid === id);
+    const all = obsSession.log.filter(e => e.sid === id);
+    const entries = all.filter(inCurrentRound), earlierN = all.length - entries.length;
     panel.innerHTML = `<div class="panel-inner">
       <div class="p-head">
         <div>
@@ -790,15 +804,16 @@ function renderPanel() {
       </div>
 
       <div>
-        <div class="p-section-title">History for this student</div>
+        <div class="p-section-title">History for this student${curRound() > 0 ? " (this activity)" : ""}</div>
         <div class="history">${historyRows(entries)}</div>
+        ${earlierN ? `<div class="h-earlier">${earlierN} earlier entr${earlierN === 1 ? "y" : "ies"} from other activities are saved in the export.</div>` : ""}
       </div>
     </div>`;
   } else {
     const t = obsSession.tables.find(x => x.id === selection.table);
     if (!t) { selection = null; panel.innerHTML = ""; $("obs-body").classList.remove("panel-open"); return; }
     const tableKey = `T${t.id}`;
-    const entries = obsSession.log.filter(e => e.table === t.id && (e.sid === tableKey || e.viaTable) )
+    const entries = obsSession.log.filter(e => e.table === t.id && (e.sid === tableKey || e.viaTable) && inCurrentRound(e))
       .filter((e, i, arr) => e.kind === "note" || arr.findIndex(x => x.group === e.group) === i);  // one row per whole-table code
     panel.innerHTML = `<div class="panel-inner">
       <div class="p-head">
@@ -838,7 +853,7 @@ function renderPanel() {
       </div>
 
       <div>
-        <div class="p-section-title">Table history</div>
+        <div class="p-section-title">Table history${curRound() > 0 ? " (this activity)" : ""}</div>
         <div class="history">${historyRows(entries)}</div>
       </div>
     </div>`;
@@ -921,10 +936,11 @@ function afterLog(flashIds) {
   autosave();
 }
 
+/* Undo the newest entry of the CURRENT activity (never reaches back into an earlier one). */
 function undoLast() {
-  if (!obsSession || !obsSession.log.length) return;
-  const g = obsSession.log[obsSession.log.length - 1].group;
-  deleteGroup(g);
+  if (!obsSession) return;
+  const last = obsSession.log.filter(inCurrentRound).pop();
+  if (last) deleteGroup(last.group);
 }
 
 /* Remove one logged item (a code, a whole-table code, a note or a TA move). */
@@ -945,9 +961,10 @@ function deleteGroup(g) {
 
 function renderFooter() {
   if (!obsSession) return;
-  const codes = new Set(obsSession.log.filter(e => e.kind === "code").map(e => e.group)).size;
-  const notes = obsSession.log.filter(e => e.kind === "note").length;
-  const moves = obsSession.log.filter(e => e.kind === "ta").length;
+  const now = obsSession.log.filter(inCurrentRound);
+  const codes = new Set(now.filter(e => e.kind === "code").map(e => e.group)).size;
+  const notes = now.filter(e => e.kind === "note").length;
+  const moves = now.filter(e => e.kind === "ta").length;
   $("log-summary").textContent = `${codes} code${codes === 1 ? "" : "s"} · ${notes} note${notes === 1 ? "" : "s"} · ${moves} TA position${moves === 1 ? "" : "s"}`;
   renderLiveLog();
 }
@@ -987,6 +1004,12 @@ function renderLiveLog() {
   });
   (obsSession.chunks || []).forEach(c => items.push({ ord: c.ord, chunk: c }));
   items.sort((a, b) => a.ord - b.ord);
+  // Blank slate per activity: hide earlier activities unless asked to show them
+  const cur = curRound();
+  const roundOfItem = it => it.e ? segIndexOf(obsSession, it.e) : it.chunk ? it.chunk.pseg : obsSession.phaseLog.indexOf(it.phase);
+  const earlier = items.filter(it => it.e && roundOfItem(it) < cur).length;
+  const visible = showEarlierLog ? items : items.filter(it => roundOfItem(it) >= cur);
+  items.length = 0; items.push(...visible);
 
   const rows = items.map(it => {
     if (it.phase) return `<div class="ll-row phase">${formatTime(it.phase.elapsedSec)} · Activity: ${escapeHTML(it.phase.phase || "none")}</div>`;
@@ -1000,13 +1023,23 @@ function renderLiveLog() {
       <button type="button" class="ll-x" onclick="deleteGroup(${e.group})" title="Undo this" aria-label="Undo this entry">×</button>
     </div>`;
   });
-  if (!rows.length) {
+  if (earlier) rows.unshift(`<button type="button" class="ll-row ll-earlier" onclick="toggleEarlierLog()">${showEarlierLog
+    ? "Hide entries from earlier activities"
+    : `Show ${earlier} entr${earlier === 1 ? "y" : "ies"} from earlier activities (all are in the export)`}</button>`);
+  if (!rows.length || (rows.length === 1 && earlier)) {
+    if (earlier) { body.innerHTML = rows[0]; return; }
     body.innerHTML = `<div class="ll-empty">Nothing logged yet. Pick the activity in the top bar to start the 1-minute table rotation, then code the students at the highlighted table: tap a student to code them, or tap the table to code everyone at it. Tap the empty space around a table (or the front strip) to mark where the TA is. Every entry appears here; tap × to undo it.</div>`;
     return;
   }
   const shown = rows.reverse().slice(0, LOG_ROWS);
   body.innerHTML = shown.join("").replace('class="ll-row"', 'class="ll-row newest"');
   body.scrollTop = 0;
+}
+
+let showEarlierLog = false;
+function toggleEarlierLog() {
+  showEarlierLog = !showEarlierLog;
+  renderLiveLog();
 }
 
 function toggleLog() {
@@ -1064,7 +1097,10 @@ function emptyBuckets() {
 function chunkSamples(s) {
   const taAt = new Map();
   let ta = null;
-  s.log.forEach(e => { if (e.kind === "ta") ta = e; else if (e.kind === "code") taAt.set(e, ta); });
+  s.log.forEach(e => {
+    if (e.kind === "ta") ta = e;
+    else if (e.kind === "code") taAt.set(e, ta && segIndexOf(s, ta) === segIndexOf(s, e) ? ta : null);   // TA marks don't carry across activities
+  });
   const out = [];
   (s.chunks || []).forEach(c => {
     if (c.end == null) return;
@@ -1152,7 +1188,8 @@ function taSegments(s) {
   const marks = s.log.filter(e => e.kind === "ta");
   return marks.map((m, i) => ({
     start: m.elapsedSec,
-    end: i < marks.length - 1 ? marks[i + 1].elapsedSec : s.totalSeconds,
+    // a mark lasts until the next one, but never past the end of its activity
+    end: Math.min(i < marks.length - 1 ? marks[i + 1].elapsedSec : s.totalSeconds, roundEnd(s, segIndexOf(s, m))),
     table: m.table, place: m.place, u: m.u, v: m.v, phase: m.phase || "(not set)",
   })).filter(x => x.end > x.start);
 }
@@ -1177,8 +1214,10 @@ function analyzeTA(s) {
     (points[p.phase] = points[p.phase] || []).push({ table: g.table, u: g.u, v: g.v, dur: ov, start: Math.max(g.start, p.start) });
   }));
 
-  let prevKey;
+  let prevKey, prevRound;
   s.log.filter(e => e.kind === "ta").forEach(m => {
+    const r = segIndexOf(s, m);
+    if (r !== prevRound) { prevKey = undefined; prevRound = r; }      // a new activity starts a fresh count
     const k = m.table == null ? "front" : m.table;
     if (k !== prevKey) { const ph = m.phase || "(not set)"; (visits[ph] = visits[ph] || {})[k] = (visits[ph][k] || 0) + 1; }
     prevKey = k;
@@ -1537,7 +1576,7 @@ function buildParticipationPDF(s) {
     ensure(50);
     font(8, "normal", PDF_INK3);
     const taNote = (flagged ? `* Fewer than ${LOW} student observations were coded with the TA at the table, so treat that number with caution. ` : "") +
-      "A student observation counts as \"TA at table\" when the TA's last marked position, at the moment the code was given, was in that student's table area; codes given before the first TA mark are left out. Visits = separate arrivals at that place. TA time is measured in seconds.";
+      "A student observation counts as \"TA at table\" when the TA's last marked position, at the moment the code was given, was in that student's table area; codes given before the TA is first marked in that activity are left out (the TA's position is marked afresh in each activity). Visits = separate arrivals at that place. TA time is measured in seconds.";
     const tl = doc.splitTextToSize(taNote, CW);
     doc.text(tl, M, y); y += tl.length * 10 + 12;
   }
@@ -1686,7 +1725,7 @@ function buildCSV(s) {
   done.forEach((c, i) => {
     const mine = samples.filter(x => x.chunk === c);
     const taPlaces = s.log.filter(e => e.kind === "ta" && e.elapsedSec < c.end && e.elapsedSec >= c.start).map(e => e.place);
-    const before = s.log.filter(e => e.kind === "ta" && e.elapsedSec <= c.start).pop();
+    const before = s.log.filter(e => e.kind === "ta" && e.elapsedSec <= c.start && segIndexOf(s, e) === c.pseg).pop();
     if (before) taPlaces.unshift(before.place);
     row([i + 1, c.phase, c.table, c.start, formatTime(c.start), c.end, c.end - c.start, c.seats,
          mine.filter(x => x.key).length, mine.map(x => `S${x.seat}=${x.key ? x.code : "-"}`).join("; "),
@@ -1713,6 +1752,7 @@ function buildCSV(s) {
     s.log.forEach(e => {
       if (e.kind === "ta") { ta = e; return; }
       if (e.kind !== "code") return;
+      if (ta && segIndexOf(s, ta) !== segIndexOf(s, e)) ta = null;   // TA marks don't carry across activities
       row([++n, e.wallTime, e.elapsedSec, formatTime(e.elapsedSec), e.phase, e.chunk != null ? chunkNo(e.chunk) : "", e.table, e.seat, e.sid, s.labels[e.sid] || "",
            e.code, codeInfo(e.code).desc, e.viaTable ? "Yes" : "No", counted.has(e) ? "Yes" : "No",
            ta ? ta.place : "(not marked yet)", ta ? (ta.table === e.table ? "Yes" : "No") : ""]);
@@ -1756,7 +1796,7 @@ function buildCSV(s) {
     row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Activity", "Place", "Table", "Seconds There", "X Within Area (0-1)", "Y Within Area (0-1)"]);
     const marks = s.log.filter(e => e.kind === "ta");
     marks.forEach((m, i) => {
-      const end = i < marks.length - 1 ? marks[i + 1].elapsedSec : s.totalSeconds;
+      const end = Math.min(i < marks.length - 1 ? marks[i + 1].elapsedSec : s.totalSeconds, roundEnd(s, segIndexOf(s, m)));
       row([i + 1, m.wallTime, m.elapsedSec, formatTime(m.elapsedSec), m.phase, m.place, m.table == null ? "" : m.table,
            Math.max(0, end - m.elapsedSec), m.u.toFixed(2), m.v.toFixed(2)]);
     });

@@ -560,3 +560,11 @@ h1, h2, h3, p { margin: 0; }
   .rot-progress { order: 5; flex-basis: 100%; }
   .rot-btn { padding: 0 10px; }
 }
+
+/* Earlier activities are hidden from the live log / history (blank slate) */
+.ll-earlier {
+  width: 100%; border: none; border-bottom: 1px solid var(--sand-2); background: var(--sand);
+  justify-content: center; cursor: pointer; font: 600 11.5px var(--sans); color: var(--ink-2);
+}
+.ll-earlier:hover { color: var(--orange); }
+.h-earlier { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
