@@ -60,11 +60,12 @@ const TA_ROSTER = [
    CSS colors and CSV column names. */
 const CODES = [
   { v: 0,   key: "0",  desc: "No interaction and no work" },
-  { v: 1,   key: "1",  desc: "Working independently, no interaction" },
-  { v: 2,   key: "2",  desc: "Working independently, just checking the final answer/product" },
-  { v: 2.5, key: "25", desc: "Working independently with occasional interaction / process" },
-  { v: 3,   key: "3",  desc: "Working collaboratively with occasional interaction" },
-  { v: 4,   key: "4",  desc: "Working collaboratively with a high interaction level" },
+  { v: 1,   key: "1",  desc: "Off-topic interaction" },
+  { v: 2,   key: "2",  desc: "Working independently, no interaction" },
+  { v: 3,   key: "3",  desc: "Working independently, just checking the final answer/product" },
+  { v: 3.5, key: "35", desc: "Working independently with occasional interaction / process" },
+  { v: 4,   key: "4",  desc: "Working collaboratively with occasional interaction" },
+  { v: 5,   key: "5",  desc: "Working collaboratively with a high interaction level" },
 ];
 const codeInfo = v => CODES.find(c => c.v === v);
 
@@ -73,7 +74,7 @@ const MIN_SEATS = 1, MAX_SEATS = 10;
 const STALE_SECONDS = 300;          // seats not coded for 5 min get a dashed outline
 const CHUNK_SEC = 60;               // 1-minute rotation: seconds spent on each table
 
-const STORAGE_KEY = "phys211coding_session_v1";
+const STORAGE_KEY = "phys211coding_session_v2";   // v2: off-topic code + per-table problem type (v1 saves aren't resumed)
 const LAST_NETID_KEY = "phys211coding_last_netid";
 
 let currentNetID = "";
@@ -230,7 +231,9 @@ function startObservation() {
     netid: currentNetID,
     section, ta, date,
     tableCount: n,
-    tables: Array.from({ length: n }, (_, i) => ({ id: i + 1, seats: DEFAULT_SEATS })),
+    tables: Array.from({ length: n }, (_, i) => ({ id: i + 1, seats: DEFAULT_SEATS, type: "" })),
+    typeLog: [],                // per-table problem type changes { table, type, elapsedSec, ord, duringChunk? }
+    nextTable: 1,               // table selected to observe next (manual rotation)
     labels: {},                 // sid -> optional student label (initials etc.)
     log: [],                    // chronological { kind: "code"|"note", group, sid, table, seat, code?, text?, elapsedSec, wallTime, phase }
     seq: 0,                     // group counter (a whole-table code is one group → one undo)
@@ -258,7 +261,6 @@ function enterObserveScreen() {
   selection = null;
   showScreen("screen-observe");
   renderLegend();
-  renderPhase();
   renderMap();
   renderRotBar();
   renderPanel();
@@ -279,35 +281,55 @@ function tick() {
   if (ago && selection && selection.type === "student") ago.textContent = agoText(sid(selection.table, selection.seat));
 }
 
-/* ── Activity type (structured vs open-ended) ─────────────────────────────
-   Every code/note is tagged with the activity running when it was logged.
-   Switching activity starts a clean slate: the map shows every student as
-   uncoded again, and earlier codes stop counting at the switch (they never
-   carry into the new activity). Earlier codes stay in each student's
-   history and in the exports. Tap the active one again to clear it. */
-function setPhase(p) {
-  if (!obsSession) return;
-  const next = obsSession.phase === p ? "" : p;
-  const now = currentElapsedSeconds();
-  endChunk(now);
-  obsSession.phase = next;
-  obsSession.phaseLog.push({ elapsedSec: now, phase: next, ord: ++obsSession.seq });
-  obsSession.phaseStartIdx = obsSession.log.length;
-  if (next) startChunk(obsSession.tables[0].id, now);   // every activity starts a fresh rotation at Table 1
-  showEarlierLog = false;
-  renderPhase();
-  renderTAMarker();
-  afterRotate(next ? `${next}: start at Table ${obsSession.tables[0].id}` : "");
+/* ── Problem type, per table ───────────────────────────────────────────
+   Groups work at different paces, so each TABLE has its own problem type
+   (Structured / Open-ended / Other), set in the rotation bar (or the table
+   panel) before its minute starts. A table keeps its type until it is
+   changed. Every minute, code and note is tagged with its table's type at
+   the time. Changing a table's type gives that table a blank slate on the
+   map; everything stays in the exports. */
+const PROBLEM_TYPES = ["Structured", "Open-ended", "Other"];
+
+function tableType(id) {
+  const t = obsSession && obsSession.tables.find(x => x.id === id);
+  return t && t.type ? t.type : "";
 }
 
-/* ── 1-minute table rotation ─────────────────────────────────────────────
-   While an activity is selected, the observer watches ONE table for one
-   minute (a "chunk") and codes its students; then the tool moves on to the
-   next table by itself (1 → 2 → … → last → 1). Each time a table comes
-   round again its seats start blank. Every code is tagged with the chunk it
-   was given in, and the exports count ONE code per student per chunk (the
-   last one given that minute) — standard time sampling. Codes given to a
-   table outside its turn are kept in the log but not counted. */
+function setTableType(tableId, type) {
+  const t = obsSession.tables.find(x => x.id === tableId);
+  if (!t || t.type === type) return;
+  t.type = type;
+  const entry = { table: tableId, type, elapsedSec: currentElapsedSeconds(), ord: ++obsSession.seq };
+  // A minute already running at this table is relabelled with the new type
+  const c = currentChunk();
+  if (c && c.table === tableId) {
+    c.phase = type;
+    obsSession.log.forEach(e => { if (e.chunk === c.n && e.table === tableId) e.phase = type; });
+    entry.duringChunk = c.n;
+  }
+  obsSession.typeLog.push(entry);
+  renderMap();
+  renderRotBar();
+  refreshPanelKeepDraft();
+  renderFooter();
+  autosave();
+}
+
+/* Index of the first log entry in the current activity round (legacy: one round). */
+function roundStart() {
+  if (!obsSession) return 0;
+  return Math.min(obsSession.phaseStartIdx || 0, obsSession.log.length);
+}
+
+/* ── 1-minute table rotation (manual) ────────────────────────────────────
+   The observer picks a table (‹ › in the bar), checks its problem type and
+   taps Start: the tool counts down one minute while they code that table's
+   students, then STOPS and waits — nothing happens until the observer
+   starts the next table. Each turn starts with the table's seats blank.
+   Every code is tagged with the minute ("chunk") it was given in, and the
+   exports count ONE code per student per chunk (the last one given that
+   minute) — standard time sampling. Codes given to a table outside its
+   minute are kept in the log but not counted. */
 function currentChunk() {
   const list = obsSession && obsSession.chunks;
   const c = list && list[list.length - 1];
@@ -318,7 +340,7 @@ function startChunk(tableId, atSec) {
   const t = obsSession.tables.find(x => x.id === tableId) || obsSession.tables[0];
   obsSession.chunks.push({
     n: ++obsSession.chunkSeq, ord: ++obsSession.seq,
-    phase: obsSession.phase, pseg: obsSession.phaseLog.length - 1,
+    phase: t.type || "", pseg: obsSession.phaseLog.length - 1,
     table: t.id, seats: t.seats, start: atSec, end: null,
   });
 }
@@ -327,8 +349,8 @@ function endChunk(atSec) {
   const c = currentChunk();
   if (!c) return;
   c.end = Math.max(c.start, atSec);
-  // A short turn (under 30 s) with nothing coded — skipped past, or cut off by
-  // an activity switch or the end — isn't a sample, so it isn't kept
+  // A short turn (under 30 s) with nothing coded — stopped early or cut off
+  // by the end — isn't a sample, so it isn't kept
   if (c.end - c.start < 30 && !obsSession.log.some(e => e.kind === "code" && e.chunk === c.n)) obsSession.chunks.pop();
 }
 
@@ -339,35 +361,62 @@ function nextTableId(fromId, dir) {
   return ids[(i + dir + ids.length) % ids.length];
 }
 
-/* Called every second: when the minute is up, move to the next table. */
+function selectedNextTable() {
+  const ids = obsSession.tables.map(t => t.id);
+  return ids.includes(obsSession.nextTable) ? obsSession.nextTable : ids[0];
+}
+
+/* Called every second: when the minute is up, stop and wait for the observer. */
 function rotationTick() {
   const c = currentChunk();
   if (!c) return;
-  const len = obsSession.chunkSec || CHUNK_SEC, now = currentElapsedSeconds(), due = c.start + len;
-  if (now < due) return;
-  endChunk(due);
-  const nextId = nextTableId(c.table, 1);
-  startChunk(nextId, now - due >= len ? now : due);    // after a long gap (e.g. reopened tab) restart the clock now
-  afterRotate(`Move to Table ${nextId}`);
+  const len = obsSession.chunkSec || CHUNK_SEC;
+  if (currentElapsedSeconds() < c.start + len) return;
+  endChunk(c.start + len);
+  obsSession.nextTable = nextTableId(c.table, 1);
+  obsSession.timeUpAt = c.table;
+  afterRotate(`Time's up at Table ${c.table} — choose the next table`);
 }
 
-/* ‹ Back / Next table › — end this chunk now and go to the neighbouring table. */
-function moveRotation(dir) {
+/* ‹ › in the bar while waiting: choose which table to observe next. */
+function pickNextTable(dir) {
+  if (currentChunk()) return;
+  obsSession.nextTable = nextTableId(selectedNextTable(), dir);
+  obsSession.timeUpAt = null;
+  renderRotBar();
+  updateSeatStates();
+  autosave();
+}
+
+function startTurn() {
+  if (currentChunk()) return;
+  const id = selectedNextTable();
+  if (!tableType(id)) { showRotBanner(`Choose Table ${id}'s problem type first`); return; }
+  obsSession.timeUpAt = null;
+  startChunk(id, currentElapsedSeconds());
+  afterRotate("");
+}
+
+/* ■ Stop: end this table's minute early and wait. */
+function stopTurn() {
   const c = currentChunk();
   if (!c) return;
-  const now = currentElapsedSeconds(), nextId = nextTableId(c.table, dir);
-  endChunk(now);
-  startChunk(nextId, now);
-  afterRotate(`Now observing Table ${nextId}`);
+  endChunk(currentElapsedSeconds());
+  obsSession.nextTable = nextTableId(c.table, 1);
+  obsSession.timeUpAt = null;
+  afterRotate("");
 }
 
+/* From the side panel: observe this table now (ends any running minute). */
 function jumpToTable(id) {
   const c = currentChunk();
-  if (!c || c.table === id) return;
+  if (c && c.table === id) return;
   const now = currentElapsedSeconds();
-  endChunk(now);
-  startChunk(id, now);
-  afterRotate(`Now observing Table ${id}`);
+  if (c) endChunk(now);
+  obsSession.nextTable = id;
+  obsSession.timeUpAt = null;
+  if (tableType(id)) { startChunk(id, now); afterRotate(`Now observing Table ${id}`); }
+  else afterRotate(`Choose Table ${id}'s problem type, then tap Start`);
 }
 
 function afterRotate(message) {
@@ -392,50 +441,59 @@ function showRotBanner(text) {
   b.textContent = text;
   b.classList.remove("show"); void b.offsetWidth; b.classList.add("show");
   clearTimeout(bannerTimer);
-  bannerTimer = setTimeout(() => b.classList.remove("show"), 2600);
+  bannerTimer = setTimeout(() => b.classList.remove("show"), 3200);
 }
 
-/* The bar above the map. Built once per chunk and only its countdown is
-   updated each second, so taps on Back / Next are never lost to a re-render. */
+function typeButtons(tableId) {
+  const cur = tableType(tableId);
+  return `<div class="type-seg" role="group" aria-label="Problem type for Table ${tableId}">${PROBLEM_TYPES.map(t =>
+    `<button type="button" class="type-btn ${cur === t ? "on" : ""}" onclick="setTableType(${tableId}, '${t}')" aria-pressed="${cur === t}">${t}</button>`).join("")}</div>`;
+}
+
+/* The bar above the map. Rebuilt only when its state changes; while a
+   minute runs only the countdown updates each second, so taps are never
+   lost to a re-render. */
 function renderRotBar() {
   const bar = $("rot-bar");
   if (!bar || !obsSession) return;
   const c = currentChunk();
+  const len = obsSession.chunkSec || CHUNK_SEC;
   if (!c) {
-    if (bar.dataset.key !== "idle") {
-      bar.dataset.key = "idle";
-      bar.className = "rot-bar idle";
-      bar.innerHTML = `<span class="rot-idle">Choose <b>Structured</b> or <b>Open-ended</b> in the top bar to start the 1-minute table rotation.</span>`;
+    const id = selectedNextTable(), type = tableType(id), up = obsSession.timeUpAt;
+    const key = `wait-${id}-${type}-${up || ""}`;
+    if (bar.dataset.key !== key) {
+      bar.dataset.key = key;
+      bar.className = "rot-bar waiting" + (up ? " time-up" : "");
+      bar.innerHTML = `
+        <div class="rot-now">
+          <span class="rot-label">${up ? `Time's up at Table ${up} · next table` : "Next table"}</span>
+          <span class="rot-pick">
+            <button type="button" class="rot-arrow" onclick="pickNextTable(-1)" aria-label="Previous table">‹</button>
+            <span class="rot-table">Table ${id}</span>
+            <button type="button" class="rot-arrow" onclick="pickNextTable(1)" aria-label="Next table">›</button>
+          </span>
+        </div>
+        ${typeButtons(id)}
+        <span class="rot-spacer"></span>
+        <button type="button" class="rot-btn start" onclick="startTurn()" ${type ? "" : "disabled"}
+          title="${type ? "" : "Choose the problem type first"}">Start 1 minute ▶</button>`;
     }
     return;
   }
-  const len = obsSession.chunkSec || CHUNK_SEC;
-  if (bar.dataset.key !== String(c.n)) {
-    const k = obsSession.chunks.filter(x => x.pseg === c.pseg).length;
-    bar.dataset.key = String(c.n);
+  const key = `run-${c.n}-${c.phase}`;
+  if (bar.dataset.key !== key) {
+    bar.dataset.key = key;
     bar.innerHTML = `
       <div class="rot-now"><span class="rot-label">Now observing</span><span class="rot-table">Table ${c.table}</span></div>
-      <span class="rot-meta">${escapeHTML(c.phase)} · minute ${k}</span>
+      ${typeButtons(c.table)}
       <div class="rot-progress" aria-hidden="true"><div id="rot-fill"></div></div>
       <span class="rot-left" id="rot-left"></span>
-      <button type="button" class="rot-btn" onclick="moveRotation(-1)" aria-label="Go back to the previous table">‹ Back</button>
-      <button type="button" class="rot-btn next" onclick="moveRotation(1)" aria-label="Move to the next table now">Next table ›</button>`;
+      <button type="button" class="rot-btn" onclick="stopTurn()" aria-label="Stop this table's minute now">■ Stop</button>`;
   }
   const left = Math.max(0, c.start + len - currentElapsedSeconds());
   bar.className = "rot-bar" + (left <= 10 ? " ending" : "");
   $("rot-fill").style.width = (100 * (1 - left / len)) + "%";
   $("rot-left").textContent = formatTime(left);
-}
-
-/* Index of the first log entry in the current activity round. */
-function roundStart() {
-  if (!obsSession) return 0;
-  return Math.min(obsSession.phaseStartIdx || 0, obsSession.log.length);
-}
-
-function renderPhase() {
-  document.querySelectorAll("#phase-tabs .obs-tab").forEach(b =>
-    b.classList.toggle("active", !!obsSession && b.dataset.phase === obsSession.phase));
 }
 
 /* ── Legend ──────────────────────────────────────────────────────────────── */
@@ -450,7 +508,7 @@ function renderLegend() {
 }
 
 function shortDesc(c) {
-  return ({ 0: "No work", 1: "Indep.", 2: "Indep. + check", 2.5: "Indep. + some talk", 3: "Collab.", 4: "Collab. high" })[c.v];
+  return ({ 0: "No work", 1: "Off-topic", 2: "Indep.", 3: "Indep. + check", 3.5: "Indep. + some talk", 4: "Collab.", 5: "Collab. high" })[c.v];
 }
 
 /* ── Tables ─────────────────────────────────────────────────────────────── */
@@ -459,12 +517,13 @@ function stepTablesLive(delta) {
   let n = Math.max(2, Math.min(16, obsSession.tableCount + delta));
   if (n === obsSession.tableCount) return;
   if (n > obsSession.tableCount) {
-    for (let i = obsSession.tableCount; i < n; i++) obsSession.tables.push({ id: i + 1, seats: DEFAULT_SEATS });
+    for (let i = obsSession.tableCount; i < n; i++) obsSession.tables.push({ id: i + 1, seats: DEFAULT_SEATS, type: "" });
   } else {
     obsSession.tables = obsSession.tables.slice(0, n);
     if (selection && selection.table > n) selection = null;
     const c = currentChunk();
-    if (c && c.table > n) { const now = currentElapsedSeconds(); endChunk(now); startChunk(obsSession.tables[0].id, now); renderRotBar(); }
+    if (c && c.table > n) endChunk(currentElapsedSeconds());
+    renderRotBar();
   }
   obsSession.tableCount = n;
   $("map-table-count").value = n;
@@ -528,7 +587,7 @@ function renderMap() {
         ${side("top")}
         <div class="table-rect" data-table="${t.id}" onclick="selectTable(${t.id})" role="button" aria-label="Table ${t.id}">
           <button type="button" class="seat-step" onclick="event.stopPropagation(); stepSeats(${t.id}, -1)" ${t.seats <= MIN_SEATS ? "disabled" : ""} aria-label="Remove a student from table ${t.id}" title="Remove a student">−</button>
-          <span class="t-center"><span class="t-label">TABLE</span><span class="t-num">${t.id}</span><span class="t-seats">${t.seats} student${t.seats === 1 ? "" : "s"}</span></span>
+          <span class="t-center"><span class="t-type ${t.type ? "t-" + t.type.toLowerCase().replace(/[^a-z]/g, "") : "t-none"}">${t.type || "no type"}</span><span class="t-num">${t.id}</span><span class="t-seats">${t.seats} student${t.seats === 1 ? "" : "s"}</span></span>
           <button type="button" class="seat-step" onclick="event.stopPropagation(); stepSeats(${t.id}, 1)" ${t.seats >= MAX_SEATS ? "disabled" : ""} aria-label="Add a student to table ${t.id}" title="Add a student">+</button>
         </div>
         ${side("bottom")}
@@ -567,29 +626,44 @@ function sizeSeats() {
   grid.style.setProperty("--tw", Math.floor(tw) + "px");
 }
 
-/* The student's current code in THIS activity round (clean slate per activity). */
+/* What each seat shows. The table whose minute is running shows only this
+   minute's codes (blank each turn). Other tables show their latest turn,
+   faded — unless their problem type has changed since (blank slate). */
+function displayCutoff(tableId) {
+  let ord = 0;
+  (obsSession.typeLog || []).forEach(x => { if (x.table === tableId && !x.duringChunk) ord = Math.max(ord, x.ord); });
+  (obsSession.chunks || []).forEach(c => { if (c.table === tableId) ord = Math.max(ord, c.ord); });
+  return ord;
+}
+
 function lastCodeEntry(id) {
-  const log = obsSession.log, cur = obsSession.phaseLog.length - 1, start = roundStart();
+  const log = obsSession.log;
+  const t = Number(id.slice(1).split("-S")[0]);
   const c = currentChunk();
-  const inTurn = c && c.table === Number(id.slice(1).split("-S")[0]);   // seat at the table being observed
+  if (c && c.table === t) {
+    for (let i = log.length - 1; i >= 0; i--) {
+      const e = log[i];
+      if (e.kind === "code" && e.sid === id && e.chunk === c.n) return e;
+    }
+    return null;
+  }
+  const cut = displayCutoff(t);
   for (let i = log.length - 1; i >= 0; i--) {
     const e = log[i];
-    if (e.kind !== "code" || e.sid !== id) continue;
-    if (inTurn) { if (e.chunk === c.n) return e; continue; }      // blank again each time its turn comes round
-    if (e.pseg != null ? e.pseg === cur : i >= start) return e;
+    if (e.group < cut) break;
+    if (e.kind === "code" && e.sid === id) return e;
   }
   return null;
 }
 
-/* Each activity is a blank slate on screen: the map, TA marker, live log and
-   panel only show what was logged in the CURRENT activity round. Earlier
-   rounds stay saved and go into the exports. */
+/* Legacy activity rounds: there is now only one, so everything is "current". */
 const curRound = () => obsSession.phaseLog.length - 1;
 const inCurrentRound = e => segIndexOf(obsSession, e) === curRound();
 function roundEnd(s, i) { return i + 1 < s.phaseLog.length ? s.phaseLog[i + 1].elapsedSec : s.totalSeconds; }
 
 function hasNote(id) {
-  return obsSession.log.some(e => e.kind === "note" && e.sid === id && inCurrentRound(e));
+  const cut = displayCutoff(Number(id.slice(1).split("-S")[0]));
+  return obsSession.log.some(e => e.kind === "note" && e.sid === id && e.group > cut);
 }
 
 function agoText(id) {
@@ -621,9 +695,11 @@ function updateSeatStates() {
     el.classList.toggle("selected", !!selection && selection.type === "table" && selection.table === +el.dataset.table);
   });
   const c = currentChunk();
+  const nextId = c ? null : selectedNextTable();
   document.querySelectorAll("#room-grid .tbl-cell").forEach(el => {
     el.classList.toggle("focus", !!c && +el.dataset.table === c.table);
     el.classList.toggle("off-focus", !!c && +el.dataset.table !== c.table);
+    el.classList.toggle("next-up", !c && +el.dataset.table === nextId);
   });
 }
 
@@ -645,7 +721,7 @@ function currentTA() {
 function logTA(entry) {
   if (!obsSession) return;
   const group = ++obsSession.seq;
-  obsSession.log.push({ ...baseEntry("ta"), group, ...entry });
+  obsSession.log.push({ ...baseEntry("ta"), phase: entry.table != null ? tableType(entry.table) : "", group, ...entry });
   renderTAMarker(true);
   renderFooter();
   autosave();
@@ -748,14 +824,16 @@ function historyRows(entries) {
     </div>`).join("");
 }
 
-/* Shown in the panel when the selected table isn't the one whose 1-minute
-   turn it is (or no activity is running), since those codes won't count. */
+/* Shown in the panel when the selected table isn't the one whose minute is
+   running (or no minute is running), since those codes won't count. */
 function turnNotice(tableId) {
   const c = currentChunk();
-  if (!c) return `<div class="rot-warn">Choose <b>Structured</b> or <b>Open-ended</b> in the top bar first — codes only count during the 1-minute table rotation.</div>`;
-  if (c.table === tableId) return "";
-  return `<div class="rot-warn">It's <b>Table ${c.table}</b>'s turn. Codes for Table ${tableId} are saved but won't count toward the 1-minute samples.
-    <button type="button" class="rot-warn-btn" onclick="jumpToTable(${tableId})">Observe Table ${tableId} now</button></div>`;
+  if (c && c.table === tableId) return "";
+  const msg = c
+    ? `It's <b>Table ${c.table}</b>'s minute. Codes for Table ${tableId} are saved but won't count toward the 1-minute samples.`
+    : `No minute is running. Codes for Table ${tableId} are saved but only count during a table's 1-minute turn.`;
+  const btn = tableType(tableId) ? `Start Table ${tableId}'s minute now` : `Choose Table ${tableId}'s problem type to start its minute`;
+  return `<div class="rot-warn">${msg}<button type="button" class="rot-warn-btn" onclick="jumpToTable(${tableId})">${btn}</button></div>`;
 }
 
 function renderPanel() {
@@ -767,11 +845,11 @@ function renderPanel() {
     const id = sid(table, seat);
     const last = lastCodeEntry(id);
     const all = obsSession.log.filter(e => e.sid === id);
-    const entries = all.filter(inCurrentRound), earlierN = all.length - entries.length;
+    const entries = all.filter(e => e.phase === tableType(table)), earlierN = all.length - entries.length;
     panel.innerHTML = `<div class="panel-inner">
       <div class="p-head">
         <div>
-          <div class="p-eyebrow">TABLE ${table} · SEAT ${seat}</div>
+          <div class="p-eyebrow">TABLE ${table} · SEAT ${seat}${tableType(table) ? " · " + escapeHTML(tableType(table).toUpperCase()) : ""}</div>
           <h2>Student ${escapeHTML(id)}</h2>
         </div>
         <button class="p-close" onclick="closePanel()" aria-label="Close">×</button>
@@ -804,16 +882,16 @@ function renderPanel() {
       </div>
 
       <div>
-        <div class="p-section-title">History for this student${curRound() > 0 ? " (this activity)" : ""}</div>
+        <div class="p-section-title">History for this student${tableType(table) ? ` (${escapeHTML(tableType(table))})` : ""}</div>
         <div class="history">${historyRows(entries)}</div>
-        ${earlierN ? `<div class="h-earlier">${earlierN} earlier entr${earlierN === 1 ? "y" : "ies"} from other activities are saved in the export.</div>` : ""}
+        ${earlierN ? `<div class="h-earlier">${earlierN} entr${earlierN === 1 ? "y" : "ies"} under other problem types ${earlierN === 1 ? "is" : "are"} saved in the export.</div>` : ""}
       </div>
     </div>`;
   } else {
     const t = obsSession.tables.find(x => x.id === selection.table);
     if (!t) { selection = null; panel.innerHTML = ""; $("obs-body").classList.remove("panel-open"); return; }
     const tableKey = `T${t.id}`;
-    const entries = obsSession.log.filter(e => e.table === t.id && (e.sid === tableKey || e.viaTable) && inCurrentRound(e))
+    const entries = obsSession.log.filter(e => e.table === t.id && (e.sid === tableKey || e.viaTable) && e.phase === tableType(t.id))
       .filter((e, i, arr) => e.kind === "note" || arr.findIndex(x => x.group === e.group) === i);  // one row per whole-table code
     panel.innerHTML = `<div class="panel-inner">
       <div class="p-head">
@@ -836,6 +914,11 @@ function renderPanel() {
         </div>
       </div>
 
+      <div>
+        <div class="p-section-title">Problem type at this table</div>
+        <div class="panel-types">${typeButtons(t.id)}</div>
+      </div>
+
       ${turnNotice(t.id)}
 
       <div>
@@ -853,7 +936,7 @@ function renderPanel() {
       </div>
 
       <div>
-        <div class="p-section-title">Table history${curRound() > 0 ? " (this activity)" : ""}</div>
+        <div class="p-section-title">Table history${tableType(t.id) ? ` (${escapeHTML(tableType(t.id))})` : ""}</div>
         <div class="history">${historyRows(entries)}</div>
       </div>
     </div>`;
@@ -871,8 +954,8 @@ function baseEntry(kind) {
     kind,
     elapsedSec: currentElapsedSeconds(),
     wallTime: new Date().toLocaleTimeString(),
-    phase: obsSession.phase || "",
-    pseg: obsSession.phaseLog.length - 1,     // which activity round it was logged in
+    phase: "",                                // set to the table's problem type by the caller
+    pseg: obsSession.phaseLog.length - 1,     // legacy activity round (always 0 now)
     chunk: currentChunk() ? currentChunk().n : null,   // which 1-minute rotation chunk
   };
 }
@@ -881,7 +964,7 @@ function codeSelected(code) {
   if (!obsSession || !selection || selection.type !== "student") return;
   const { table, seat } = selection;
   const group = ++obsSession.seq;
-  obsSession.log.push({ ...baseEntry("code"), group, sid: sid(table, seat), table, seat, code });
+  obsSession.log.push({ ...baseEntry("code"), phase: tableType(table), group, sid: sid(table, seat), table, seat, code });
   afterLog([sid(table, seat)]);
 }
 
@@ -891,7 +974,7 @@ function codeTable(code) {
   const group = ++obsSession.seq;
   const ids = [];
   for (let s = 1; s <= t.seats; s++) {
-    obsSession.log.push({ ...baseEntry("code"), group, sid: sid(t.id, s), table: t.id, seat: s, code, viaTable: true });
+    obsSession.log.push({ ...baseEntry("code"), phase: tableType(t.id), group, sid: sid(t.id, s), table: t.id, seat: s, code, viaTable: true });
     ids.push(sid(t.id, s));
   }
   afterLog(ids);
@@ -905,10 +988,10 @@ function saveNote() {
   const group = ++obsSession.seq;
   if (selection.type === "student") {
     const { table, seat } = selection;
-    obsSession.log.push({ ...baseEntry("note"), group, sid: sid(table, seat), table, seat, text });
+    obsSession.log.push({ ...baseEntry("note"), phase: tableType(table), group, sid: sid(table, seat), table, seat, text });
     afterLog([sid(table, seat)]);
   } else {
-    obsSession.log.push({ ...baseEntry("note"), group, sid: `T${selection.table}`, table: selection.table, seat: "", text });
+    obsSession.log.push({ ...baseEntry("note"), phase: tableType(selection.table), group, sid: `T${selection.table}`, table: selection.table, seat: "", text });
     afterLog([]);
   }
 }
@@ -1003,17 +1086,19 @@ function renderLiveLog() {
     items.push({ ord, phase: p });
   });
   (obsSession.chunks || []).forEach(c => items.push({ ord: c.ord, chunk: c }));
+  (obsSession.typeLog || []).forEach(x => items.push({ ord: x.ord, typeChange: x }));
   items.sort((a, b) => a.ord - b.ord);
   // Blank slate per activity: hide earlier activities unless asked to show them
   const cur = curRound();
-  const roundOfItem = it => it.e ? segIndexOf(obsSession, it.e) : it.chunk ? it.chunk.pseg : obsSession.phaseLog.indexOf(it.phase);
+  const roundOfItem = it => it.e ? segIndexOf(obsSession, it.e) : it.chunk ? it.chunk.pseg : it.typeChange ? cur : obsSession.phaseLog.indexOf(it.phase);
   const earlier = items.filter(it => it.e && roundOfItem(it) < cur).length;
   const visible = showEarlierLog ? items : items.filter(it => roundOfItem(it) >= cur);
   items.length = 0; items.push(...visible);
 
   const rows = items.map(it => {
     if (it.phase) return `<div class="ll-row phase">${formatTime(it.phase.elapsedSec)} · Activity: ${escapeHTML(it.phase.phase || "none")}</div>`;
-    if (it.chunk) return `<div class="ll-row chunk">${formatTime(it.chunk.start)} · Observing Table ${it.chunk.table} (1-minute turn)</div>`;
+    if (it.chunk) return `<div class="ll-row chunk">${formatTime(it.chunk.start)} · Observing Table ${it.chunk.table}${it.chunk.phase ? " · " + escapeHTML(it.chunk.phase) : ""} (1-minute turn${it.chunk.end != null ? `, ${formatTime(it.chunk.end - it.chunk.start)}` : ""})</div>`;
+    if (it.typeChange) return `<div class="ll-row phase">${formatTime(it.typeChange.elapsedSec)} · Table ${it.typeChange.table} problem type: ${escapeHTML(it.typeChange.type)}</div>`;
     const e = it.e;
     const n = e.viaTable ? obsSession.log.filter(x => x.group === e.group).length : 0;
     return `<div class="ll-row" data-group="${e.group}">
@@ -1028,7 +1113,7 @@ function renderLiveLog() {
     : `Show ${earlier} entr${earlier === 1 ? "y" : "ies"} from earlier activities (all are in the export)`}</button>`);
   if (!rows.length || (rows.length === 1 && earlier)) {
     if (earlier) { body.innerHTML = rows[0]; return; }
-    body.innerHTML = `<div class="ll-empty">Nothing logged yet. Pick the activity in the top bar to start the 1-minute table rotation, then code the students at the highlighted table: tap a student to code them, or tap the table to code everyone at it. Tap the empty space around a table (or the front strip) to mark where the TA is. Every entry appears here; tap × to undo it.</div>`;
+    body.innerHTML = `<div class="ll-empty">Nothing logged yet. In the bar above the map, pick a table, choose its problem type and tap Start 1 minute, then code the students at the highlighted table: tap a student to code them, or tap the table to code everyone at it. When the minute is up the tool waits until you start the next table. Tap the empty space around a table (or the front strip) to mark where the TA is. Every entry appears here; tap × to undo it.</div>`;
     return;
   }
   const shown = rows.reverse().slice(0, LOG_ROWS);
@@ -1166,8 +1251,9 @@ function analyze(s) {
 const chunksIn = (s, phase, tableId) => (s.chunks || []).filter(c => c.end != null && (c.phase || "(not set)") === phase && (tableId == null || c.table === tableId));
 
 const pct = (part, whole) => (whole ? (100 * part / whole) : 0);
-const COLLAB_KEYS = ["3", "4"];                  // working collaboratively
-const INTERACT_KEYS = ["25", "3", "4"];          // any peer interaction
+const COLLAB_KEYS = ["4", "5"];                  // working collaboratively
+const INTERACT_KEYS = ["35", "4", "5"];          // any on-task peer interaction (off-topic talk is code 1)
+const OFFTOPIC_KEYS = ["1"];
 const sumKeys = (secs, keys) => keys.reduce((a, k) => a + secs[k], 0);
 
 /* Mean code over a set of observations (counts per code). */
@@ -1194,32 +1280,59 @@ function taSegments(s) {
   })).filter(x => x.end > x.start);
 }
 
+/* Each table's problem type over time: [{ start, end, type }]. */
+function typeSegments(s, tableId) {
+  const changes = (s.typeLog || []).filter(x => x.table === tableId).sort((a, b) => a.elapsedSec - b.elapsedSec || a.ord - b.ord);
+  const out = [];
+  let cur = { start: 0, type: "" };
+  changes.forEach(x => {
+    if (x.elapsedSec > cur.start) out.push({ start: cur.start, end: x.elapsedSec, type: cur.type });
+    cur = { start: x.elapsedSec, type: x.type };
+  });
+  if (s.totalSeconds > cur.start) out.push({ start: cur.start, end: s.totalSeconds, type: cur.type });
+  return out;
+}
+
+/* TA time at a table is filed under that TABLE's problem type at the time;
+   time at the front of the room isn't tied to a table, so it's kept apart. */
 function analyzeTA(s) {
   const segs = taSegments(s);
-  const phases = phaseSegments(s).map(p => ({ ...p, phase: p.phase || "(not set)" }));
-  const pres = {};        // phase -> { with, without } buckets
-  const presTable = {};   // table -> phase -> { with, without }
-  const time = {};        // phase -> { front, [tableId] } seconds
-  const visits = {};      // phase -> { front, [tableId] } count of arrivals
-  const points = {};      // phase -> [{ table, u, v, dur }]
-  const phaseMarked = {}; // phase -> seconds with a known TA position
+  const pres = {};        // type -> { with, without } counts
+  const presTable = {};   // table -> type -> { with, without }
+  const time = {};        // type -> { [tableId] } seconds
+  const visits = {};      // type -> { [tableId] } count of arrivals
+  const points = {};      // type -> [{ table, u, v, dur, start }]
+  const phaseMarked = {}; // type -> TA seconds at tables of that type
+  const front = { sec: 0, visits: 0, points: [] };
   const get = (o, ...ks) => ks.reduce((acc, k, i) => (acc[k] = acc[k] || (i === ks.length - 1 ? emptyBuckets() : {})), o);
 
-  segs.forEach(g => phases.forEach(p => {
-    const ov = Math.min(g.end, p.end) - Math.max(g.start, p.start);
-    if (ov <= 0) return;
-    const k = g.table == null ? "front" : g.table;
-    (time[p.phase] = time[p.phase] || {})[k] = (time[p.phase][k] || 0) + ov;
-    phaseMarked[p.phase] = (phaseMarked[p.phase] || 0) + ov;
-    (points[p.phase] = points[p.phase] || []).push({ table: g.table, u: g.u, v: g.v, dur: ov, start: Math.max(g.start, p.start) });
-  }));
+  segs.forEach(g => {
+    if (g.table == null) {
+      front.sec += g.end - g.start;
+      front.points.push({ table: null, u: g.u, v: g.v, dur: g.end - g.start, start: g.start });
+      return;
+    }
+    typeSegments(s, g.table).forEach(ts => {
+      const ov = Math.min(g.end, ts.end) - Math.max(g.start, ts.start);
+      if (ov <= 0) return;
+      const ph = ts.type || "(not set)";
+      (time[ph] = time[ph] || {})[g.table] = (time[ph][g.table] || 0) + ov;
+      phaseMarked[ph] = (phaseMarked[ph] || 0) + ov;
+      (points[ph] = points[ph] || []).push({ table: g.table, u: g.u, v: g.v, dur: ov, start: Math.max(g.start, ts.start) });
+    });
+  });
 
-  let prevKey, prevRound;
+  let prevKey;
   s.log.filter(e => e.kind === "ta").forEach(m => {
-    const r = segIndexOf(s, m);
-    if (r !== prevRound) { prevKey = undefined; prevRound = r; }      // a new activity starts a fresh count
     const k = m.table == null ? "front" : m.table;
-    if (k !== prevKey) { const ph = m.phase || "(not set)"; (visits[ph] = visits[ph] || {})[k] = (visits[ph][k] || 0) + 1; }
+    if (k !== prevKey) {
+      if (m.table == null) front.visits++;
+      else {
+        const ts = typeSegments(s, m.table).find(x => m.elapsedSec >= x.start && m.elapsedSec < x.end);
+        const ph = (ts && ts.type) || "(not set)";
+        (visits[ph] = visits[ph] || {})[k] = (visits[ph][k] || 0) + 1;
+      }
+    }
     prevKey = k;
   });
 
@@ -1231,7 +1344,7 @@ function analyzeTA(s) {
     get(presTable, x.table, x.phase, w)[x.key]++;
   });
 
-  return { segs, pres, presTable, time, visits, points, phaseMarked, marks: s.log.filter(e => e.kind === "ta").length };
+  return { segs, pres, presTable, time, visits, points, phaseMarked, front, marks: s.log.filter(e => e.kind === "ta").length };
 }
 
 /* ── Participation report (PDF) ──────────────────────────────────────────
@@ -1240,15 +1353,16 @@ function analyzeTA(s) {
    one for Open-ended activities. Codes are ordinal, so they share one
    light→dark blue ramp (darker = more interaction). The numbers behind it
    are in the CSV. */
-const MAIN_PHASES = ["Structured", "Open-ended"];
+const MAIN_PHASES = ["Structured", "Open-ended", "Other"];
 
 const PDF_CODE_COLORS = {
   "0":  { bg: "#E4E1DA", fg: "#4A4740" },
-  "1":  { bg: "#DCE8F6", fg: "#13294B" },
-  "2":  { bg: "#ADC9EA", fg: "#13294B" },
-  "25": { bg: "#6E9FD6", fg: "#FFFFFF" },
-  "3":  { bg: "#2F6BB2", fg: "#FFFFFF" },
-  "4":  { bg: "#13294B", fg: "#FFFFFF" },
+  "1":  { bg: "#F2D9A4", fg: "#6B4A00" },   // off-topic: amber, apart from the on-task blue ramp
+  "2":  { bg: "#DCE8F6", fg: "#13294B" },
+  "3":  { bg: "#ADC9EA", fg: "#13294B" },
+  "35": { bg: "#6E9FD6", fg: "#FFFFFF" },
+  "4":  { bg: "#2F6BB2", fg: "#FFFFFF" },
+  "5":  { bg: "#13294B", fg: "#FFFFFF" },
 };
 const PDF_INK = "#1A1814", PDF_INK2 = "#4A4740", PDF_INK3 = "#77746B", PDF_LINE = "#E2DED5", PDF_ACCENT = "#E84A00";
 
@@ -1269,6 +1383,7 @@ function phaseStats(b) {
     b, tot,
     mean: Number(weightedMean(b)),
     collab: pct(sumKeys(b, COLLAB_KEYS), tot),
+    offtopic: pct(sumKeys(b, OFFTOPIC_KEYS), tot),
     interact: pct(sumKeys(b, INTERACT_KEYS), tot),
     none: pct(b["0"], tot),
   };
@@ -1330,7 +1445,7 @@ function buildParticipationPDF(s) {
   doc.text("PHYS 211 · GROUP-WORK PARTICIPATION", M, y);
   y += 22;
   font(19, "bold");
-  doc.text("Structured vs. open-ended participation by table", M, y);
+  doc.text("Participation by problem type and table", M, y);
   y += 17;
   font(9.5, "normal", PDF_INK2);
   const totalStudents = s.tables.reduce((a, t) => a + t.seats, 0);
@@ -1340,8 +1455,8 @@ function buildParticipationPDF(s) {
   const cls = {};
   MAIN_PHASES.forEach(p => (cls[p] = phaseStats(A.byPhase[p])));
   const notes = [];
-  if (!MAIN_PHASES.some(p => cls[p])) notes.push("No codes were recorded during a Structured or Open-ended activity. Select the activity in the top bar while coding so the two can be compared.");
-  else MAIN_PHASES.forEach(p => { if (!cls[p]) notes.push(`No codes were recorded during ${p} activities, so those bars are empty.`); });
+  if (!MAIN_PHASES.some(p => cls[p])) notes.push("No codes were recorded during a table's 1-minute turn. Start a table's minute in the bar above the map while coding.");
+  else MAIN_PHASES.forEach(p => { if (!cls[p]) notes.push(`No codes were recorded on ${p} problems, so those bars are empty.`); });
   const others = Object.keys(A.byPhase).filter(p => !MAIN_PHASES.includes(p));
   if (others.length) notes.push(`Codes recorded under ${others.map(p => `"${p}"`).join(" or ")} are left out of this report (they are in the CSV).`);
   if (notes.length) {
@@ -1355,43 +1470,41 @@ function buildParticipationPDF(s) {
   font(12.5, "bold");
   doc.text("Whole class", M, y);
   y += 16;
-  const colS = M + 300, colO = M + 395, colD = M + CW;
+  const colS = M + 268, colO = M + 340, colX = M + 412, colD = M + CW;
+  const cols = [["Structured", colS], ["Open-ended", colO], ["Other", colX]];
   font(8.5, "bold", PDF_INK3);
-  doc.text("Structured", colS, y, { align: "right" });
-  doc.text("Open-ended", colO, y, { align: "right" });
-  doc.text("Change", colD, y, { align: "right" });
+  cols.forEach(([p, x]) => doc.text(p, x, y, { align: "right" }));
+  doc.text("Open vs. Struct.", colD, y, { align: "right" });
   y += 6;
   line(M, y, M + CW, y);
-  const minutesIn = p => phaseSegments(s).filter(x => x.phase === p).reduce((a, x) => a + x.end - x.start, 0);
+  const minutesIn = p => chunksIn(s, p).reduce((a, c) => a + c.end - c.start, 0);
   const kpis = [
-    ["Mean code (0–4)", st => st.mean.toFixed(2), (a, b) => signed(b.mean - a.mean, 2)],
-    ["Working collaboratively (codes 3–4)", st => `${Math.round(st.collab)}%`, (a, b) => `${signed(b.collab - a.collab, 0)} pts`],
-    ["Any peer interaction (codes 2.5–4)", st => `${Math.round(st.interact)}%`, (a, b) => `${signed(b.interact - a.interact, 0)} pts`],
+    ["Mean code (0–5)", st => st.mean.toFixed(2), (a, b) => signed(b.mean - a.mean, 2)],
+    ["Working collaboratively (codes 4–5)", st => `${Math.round(st.collab)}%`, (a, b) => `${signed(b.collab - a.collab, 0)} pts`],
+    ["Any on-task peer interaction (codes 3.5–5)", st => `${Math.round(st.interact)}%`, (a, b) => `${signed(b.interact - a.interact, 0)} pts`],
+    ["Off-topic interaction (code 1)", st => `${Math.round(st.offtopic)}%`, (a, b) => `${signed(b.offtopic - a.offtopic, 0)} pts`],
     ["No work (code 0)", st => `${Math.round(st.none)}%`, (a, b) => `${signed(b.none - a.none, 0)} pts`],
   ];
   kpis.forEach(([label, val, diff]) => {
     y += 16;
     font(9.5, "normal", PDF_INK2); doc.text(label, M, y);
     font(10.5, "bold");
-    doc.text(cls.Structured ? val(cls.Structured) : "—", colS, y, { align: "right" });
-    doc.text(cls["Open-ended"] ? val(cls["Open-ended"]) : "—", colO, y, { align: "right" });
+    cols.forEach(([p, x]) => doc.text(cls[p] ? val(cls[p]) : "—", x, y, { align: "right" }));
     font(9.5, "normal", PDF_INK2);
     doc.text(cls.Structured && cls["Open-ended"] ? diff(cls.Structured, cls["Open-ended"]) : "—", colD, y, { align: "right" });
     y += 6; line(M, y, M + CW, y);
   });
   y += 16;
-  font(9.5, "normal", PDF_INK2); doc.text("Length of activity", M, y);
+  font(9.5, "normal", PDF_INK2); doc.text("Time observed (1-minute turns)", M, y);
   font(10.5, "bold");
-  doc.text(formatTime(minutesIn("Structured")), colS, y, { align: "right" });
-  doc.text(formatTime(minutesIn("Open-ended")), colO, y, { align: "right" });
+  cols.forEach(([p, x]) => doc.text(formatTime(minutesIn(p)), x, y, { align: "right" }));
   y += 6; line(M, y, M + CW, y);
   [["1-minute table chunks observed", p => String(chunksIn(s, p).length)],
    ["Student observations coded", p => String(cls[p] ? cls[p].tot : 0)]].forEach(([label, val]) => {
     y += 16;
     font(9.5, "normal", PDF_INK2); doc.text(label, M, y);
     font(10.5, "bold");
-    doc.text(val("Structured"), colS, y, { align: "right" });
-    doc.text(val("Open-ended"), colO, y, { align: "right" });
+    cols.forEach(([p, x]) => doc.text(val(p), x, y, { align: "right" }));
     y += 6; line(M, y, M + CW, y);
   });
 
@@ -1409,18 +1522,18 @@ function buildParticipationPDF(s) {
     font(7.5, "bold", col.fg); doc.text(String(c.v), lx + 11, ly + 8.6, { align: "center" });
     font(8.5, "normal", PDF_INK2); doc.text(doc.splitTextToSize(c.desc, legCol - 40), lx + 28, ly + 9, { lineHeightFactor: 1.15 });
   });
-  y += 3 * 24 + 22;
+  y += Math.ceil(CODES.length / 2) * 24 + 22;
 
   /* ── Rows: whole class, then each table ── */
   const LABEL_W = 70, MEAN_W = 92;
   const barX = M + LABEL_W, barW = CW - LABEL_W - MEAN_W, BAR_H = 15;
-  const block = (title, subtitle, stA, stB) => {
-    ensure(72);
+  const block = (title, subtitle, stA, stB, stC) => {
+    ensure(96);
     font(11, "bold"); doc.text(title, M, y);
     if (subtitle) { const tw = doc.getTextWidth(title); font(9, "normal", PDF_INK3); doc.text(subtitle, M + tw + 6, y); }
     if (stA && stB) { font(9, "bold", PDF_INK2); doc.text(`Change in mean code ${signed(stB.mean - stA.mean, 2)}`, M + CW, y, { align: "right" }); }
     y += 9;
-    [["Structured", stA], ["Open-ended", stB]].forEach(([lab, st]) => {
+    [["Structured", stA], ["Open-ended", stB], ["Other", stC]].forEach(([lab, st]) => {
       font(9, "normal", PDF_INK2); doc.text(lab, M, y + BAR_H / 2 + 3);
       bar(barX, y, barW, BAR_H, st);
       if (st) {
@@ -1434,20 +1547,20 @@ function buildParticipationPDF(s) {
 
   ensure(110);
   font(12.5, "bold"); doc.text("By table", M, y); y += 20;
-  block("All tables", "whole class", cls.Structured, cls["Open-ended"]);
+  block("All tables", "whole class", cls.Structured, cls["Open-ended"], cls.Other);
   s.tables.forEach(t => {
     const tp = A.byTablePhase[t.id] || {};
     const nc = p => chunksIn(s, p, t.id).length;
-    block(`Table ${t.id}`, `${t.seats} student${t.seats === 1 ? "" : "s"} · ${nc("Structured")} structured / ${nc("Open-ended")} open-ended chunks`,
-          phaseStats(tp.Structured), phaseStats(tp["Open-ended"]));
+    block(`Table ${t.id}`, `${t.seats} student${t.seats === 1 ? "" : "s"} · minutes observed: ${nc("Structured")} structured, ${nc("Open-ended")} open-ended, ${nc("Other")} other`,
+          phaseStats(tp.Structured), phaseStats(tp["Open-ended"]), phaseStats(tp.Other));
   });
 
   /* ── Method ── */
   font(8, "normal", PDF_INK3);
-  ensure(14 + doc.splitTextToSize("Time sampling with a 1-minute table rotation: the observer watches one table per minute and codes its students, then moves to the next table. Each minute gives one observation per student at that table, using the last code given that minute; students not coded that minute are left out. Each activity starts its own rotation at Table 1. Percentages are shares of coded student observations; the mean uses the code values (0, 1, 2, 2.5, 3, 4). Collaborative = codes 3–4; any peer interaction = codes 2.5–4. Every observation and the full coding log are in the CSV.", CW).length * 10);
+  ensure(14 + doc.splitTextToSize("Time sampling with a 1-minute table rotation: the observer watches one table per minute and codes its students, then moves to the next table. Each minute gives one observation per student at that table, using the last code given that minute; students not coded that minute are left out. Each table has its own problem type (Structured / Open-ended / Other), and every minute counts under its table's type at the time. Percentages are shares of coded student observations; the mean uses the code values (0, 1, 2, 3, 3.5, 4, 5). Collaborative = codes 4–5; any on-task peer interaction = codes 3.5–5; off-topic = code 1. Every observation and the full coding log are in the CSV.", CW).length * 10);
   font(8, "bold", PDF_INK3); doc.text("HOW THIS IS CALCULATED", M, y); y += 11;
   font(8, "normal", PDF_INK3);
-  const method = "Time sampling with a 1-minute table rotation: the observer watches one table per minute and codes its students, then moves to the next table. Each minute gives one observation per student at that table, using the last code given that minute; students not coded that minute are left out. Each activity starts its own rotation at Table 1. Percentages are shares of coded student observations; the mean uses the code values (0, 1, 2, 2.5, 3, 4). Collaborative = codes 3–4; any peer interaction = codes 2.5–4. Every observation and the full coding log are in the CSV.";
+  const method = "Time sampling with a 1-minute table rotation: the observer watches one table per minute and codes its students, then moves to the next table. Each minute gives one observation per student at that table, using the last code given that minute; students not coded that minute are left out. Each table has its own problem type (Structured / Open-ended / Other), and every minute counts under its table's type at the time. Percentages are shares of coded student observations; the mean uses the code values (0, 1, 2, 3, 3.5, 4, 5). Collaborative = codes 4–5; any on-task peer interaction = codes 3.5–5; off-topic = code 1. Every observation and the full coding log are in the CSV.";
   const ml = doc.splitTextToSize(method, CW);
   doc.text(ml, M, y); y += ml.length * 10;
 
@@ -1469,7 +1582,7 @@ function buildParticipationPDF(s) {
     font(16, "bold"); doc.text("Where the TA was", M, y);
     font(8.5, "normal", PDF_INK3); doc.text("time under each table = total TA time in that table's area", M + CW, y, { align: "right" });
     y += 14;
-    const mapW = (CW - 16) / 2, mapH = 190, strip = 14;
+    const mapW = (CW - 24) / 3, mapH = 150, strip = 14;
     const maxDur = Math.max(1, ...MAIN_PHASES.flatMap(ph => (T.points[ph] || []).map(pt => pt.dur)));
     const layout = roomLayout(s.tables.length, false);
     const drawMap = (mx, my, ph) => {
@@ -1494,9 +1607,6 @@ function buildParticipationPDF(s) {
           for (let j = 0; j < k; j++) { doc.setDrawColor("#C9C4B9"); doc.setFillColor("#FFFFFF"); doc.circle(tx + tw * (j + 0.5) / k, sy, r, "FD"); }
         });
       });
-      const ft = (T.time[ph] || {}).front;
-      if (ft) { font(9.5, "bold", PDF_INK2); const w0 = doc.getTextWidth(ph); font(8, "normal", PDF_INK3); doc.text("· front of room ", mx + w0 + 9, my + 8);
-        const w1 = doc.getTextWidth("· front of room "); font(8, "bold", PDF_INK); doc.text(formatTime(ft), mx + w0 + 9 + w1, my + 8); }
       const pts = (T.points[ph] || []).slice().sort((a, b) => b.dur - a.dur);
       doc.setGState(new doc.GState({ opacity: 0.88 }));
       pts.forEach(pt => {
@@ -1514,8 +1624,11 @@ function buildParticipationPDF(s) {
       doc.setGState(new doc.GState({ opacity: 1 }));
       if (!pts.length) { font(8, "italic", PDF_INK3); doc.text("TA position not marked", mx + mapW / 2, ry + gh / 2, { align: "center" }); }
     };
-    MAIN_PHASES.forEach((ph, i) => drawMap(M + i * (mapW + 16), y, ph));
-    y += mapH + 44;
+    MAIN_PHASES.forEach((ph, i) => drawMap(M + i * (mapW + 12), y, ph));
+    y += mapH + 30;
+    font(8.5, "normal", PDF_INK2);
+    doc.text(`TA time is filed under each table's problem type at the time. Front of room (any type): ${formatTime(T.front.sec)}, ${T.front.visits} visit${T.front.visits === 1 ? "" : "s"}.`, M, y);
+    y += 24;
     // Legend: color = when (red = start of class, blue = end), size = how long
     { const lx = M, lw = 200, lh = 7;
       for (let k = 0; k < 100; k++) { doc.setFillColor(timeColor(k / 99)); doc.rect(lx + lw * k / 100, y, lw / 100 + 0.4, lh, "F"); }
@@ -1546,7 +1659,7 @@ function buildParticipationPDF(s) {
       doc.text("% collab. TA at table", cWith, y, { align: "right" }); doc.text("TA elsewhere", cWo, y, { align: "right" });
       doc.text("Difference", cDiff, y, { align: "right" });
       y += 5; line(M, y, M + CW, y);
-      const rowsList = [["Front of room", "front", null], ...s.tables.map(t => [`Table ${t.id}`, t.id, t.id])];
+      const rowsList = s.tables.map(t => [`Table ${t.id}`, t.id, t.id]);
       rowsList.forEach(([label, key, tid]) => {
         y += 14;
         const sec = (T.time[ph] || {})[key] || 0;
@@ -1690,9 +1803,9 @@ function buildCSV(s) {
   const statCols = b => {
     const tot = totalCount(b);
     return [...CODES.map(c => pct(b[c.key], tot).toFixed(1)), tot, weightedMean(b),
-            pct(sumKeys(b, COLLAB_KEYS), tot).toFixed(1), pct(sumKeys(b, INTERACT_KEYS), tot).toFixed(1)];
+            pct(sumKeys(b, COLLAB_KEYS), tot).toFixed(1), pct(sumKeys(b, INTERACT_KEYS), tot).toFixed(1), pct(sumKeys(b, OFFTOPIC_KEYS), tot).toFixed(1)];
   };
-  const statHead = [...CODES.map(c => `% at ${c.v}`), "Coded Observations", "Mean Code", "% Collaborative (3-4)", "% Any Interaction (2.5-4)"];
+  const statHead = [...CODES.map(c => `% at ${c.v}`), "Coded Observations", "Mean Code", "% Collaborative (4-5)", "% On-Task Interaction (3.5-5)", "% Off-Topic (1)"];
 
   L.push("PHYS 211 Group-Work Coding Export");
   row(["Exported", new Date().toLocaleString()]);
@@ -1705,7 +1818,7 @@ function buildCSV(s) {
   row(["Total Students", s.tables.reduce((a, t) => a + t.seats, 0)]);
   row(["Total Observation Time", formatTime(s.totalSeconds)]);
   row(["Total Observation Time (seconds)", s.totalSeconds]);
-  row(["Sampling", `1-minute table rotation: one observation per student per chunk (the last code given that minute)`]);
+  row(["Sampling", `Manual 1-minute table turns: one observation per student per turn (the last code given that minute); each table has its own problem type`]);
   row(["Chunk Length (seconds)", s.chunkSec || CHUNK_SEC]);
   row(["Chunks Observed", done.length]);
   L.push("");
@@ -1715,13 +1828,13 @@ function buildCSV(s) {
   CODES.forEach(c => row([c.v, c.desc]));
   L.push("");
 
-  L.push("=== ACTIVITY TYPE LOG ===");
-  row(["ElapsedSeconds", "Elapsed", "Activity"]);
-  s.phaseLog.forEach(p => row([p.elapsedSec, formatTime(p.elapsedSec), p.phase || "(not set)"]));
+  L.push("=== PROBLEM TYPE LOG (per table) ===");
+  row(["ElapsedSeconds", "Elapsed", "Table", "Problem Type", "Changed During That Table's Minute"]);
+  (s.typeLog || []).forEach(x => row([x.elapsedSec, formatTime(x.elapsedSec), x.table, x.type, x.duringChunk ? "Yes (the whole minute was relabelled)" : "No"]));
   L.push("");
 
   L.push("=== 1-MINUTE ROTATION CHUNKS ===");
-  row(["Chunk #", "Activity", "Table", "Start (s)", "Start", "End (s)", "Duration (s)", "Students at Table", "Students Coded", "Codes (seat=code)", "TA Places During Chunk"]);
+  row(["Chunk #", "Problem Type", "Table", "Start (s)", "Start", "End (s)", "Duration (s)", "Students at Table", "Students Coded", "Codes (seat=code)", "TA Places During Chunk"]);
   done.forEach((c, i) => {
     const mine = samples.filter(x => x.chunk === c);
     const taPlaces = s.log.filter(e => e.kind === "ta" && e.elapsedSec < c.end && e.elapsedSec >= c.start).map(e => e.place);
@@ -1734,7 +1847,7 @@ function buildCSV(s) {
   L.push("");
 
   L.push("=== STUDENT OBSERVATIONS (one row per student per chunk) ===");
-  row(["Chunk #", "Activity", "Table", "Seat", "StudentID", "StudentLabel", "Chunk Start (s)", "Code", "Code Description", "Coded At (s)", "Coded As Whole Table", "TA Position When Coded", "TA At This Table"]);
+  row(["Chunk #", "Problem Type", "Table", "Seat", "StudentID", "StudentLabel", "Chunk Start (s)", "Code", "Code Description", "Coded At (s)", "Coded As Whole Table", "TA Position When Coded", "TA At This Table"]);
   samples.forEach(x => {
     const e = x.entry;
     row([done.indexOf(x.chunk) + 1, x.phase, x.table, x.seat, x.sid, s.labels[x.sid] || "", x.chunk.start,
@@ -1744,7 +1857,7 @@ function buildCSV(s) {
   L.push("");
 
   L.push("=== CODING LOG (every code tapped) ===");
-  row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Activity", "Chunk #", "Table", "Seat", "StudentID", "StudentLabel", "Code", "Code Description", "Coded As Whole Table", "Counted (last code at this table in its turn)", "TA Position When Coded", "TA At This Table When Coded"]);
+  row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Problem Type", "Chunk #", "Table", "Seat", "StudentID", "StudentLabel", "Code", "Code Description", "Coded As Whole Table", "Counted (last code at this table in its turn)", "TA Position When Coded", "TA At This Table When Coded"]);
   {
     const counted = new Set(samples.filter(x => x.entry).map(x => x.entry));
     const chunkNo = n => { const i = done.findIndex(c => c.n === n); return i < 0 ? "" : i + 1; };
@@ -1761,26 +1874,26 @@ function buildCSV(s) {
   L.push("");
 
   L.push("=== QUALITATIVE NOTES ===");
-  row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Activity", "Table", "Seat", "StudentID", "StudentLabel", "Note"]);
+  row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Problem Type", "Table", "Seat", "StudentID", "StudentLabel", "Note"]);
   s.log.filter(e => e.kind === "note").forEach((e, i) =>
     row([i + 1, e.wallTime, e.elapsedSec, formatTime(e.elapsedSec), e.phase, e.table, e.seat || "(whole table)", e.seat ? e.sid : "", e.seat ? (s.labels[e.sid] || "") : "", e.text]));
   L.push("");
 
-  L.push("=== OBSERVATIONS AT EACH CODE BY ACTIVITY TYPE (student-chunks) ===");
-  row(["Activity", "Chunks", ...codeCols, ...statHead]);
+  L.push("=== OBSERVATIONS AT EACH CODE BY PROBLEM TYPE (student-chunks) ===");
+  row(["Problem Type", "Chunks", ...codeCols, ...statHead]);
   Object.keys(byPhase).forEach(p => row([p, chunksIn(s, p).length, ...CODES.map(c => byPhase[p][c.key]), ...statCols(byPhase[p])]));
   L.push("");
 
-  L.push("=== PARTICIPATION BY TABLE AND ACTIVITY TYPE (student-chunks) ===");
-  row(["Table", "Seats", "Activity", "Chunks", ...codeCols, ...statHead]);
+  L.push("=== PARTICIPATION BY TABLE AND PROBLEM TYPE (student-chunks) ===");
+  row(["Table", "Seats", "Problem Type", "Chunks", ...codeCols, ...statHead]);
   s.tables.forEach(t => Object.keys(byTablePhase[t.id] || {}).forEach(ph => {
     const b = byTablePhase[t.id][ph];
     row([t.id, t.seats, ph, chunksIn(s, ph, t.id).length, ...CODES.map(c => b[c.key]), ...statCols(b)]);
   }));
   L.push("");
 
-  L.push("=== PARTICIPATION BY STUDENT AND ACTIVITY TYPE (student-chunks) ===");
-  row(["StudentID", "Table", "Seat", "StudentLabel", "Activity", "Chunks", ...codeCols, ...statHead]);
+  L.push("=== PARTICIPATION BY STUDENT AND PROBLEM TYPE (student-chunks) ===");
+  row(["StudentID", "Table", "Seat", "StudentLabel", "Problem Type", "Chunks", ...codeCols, ...statHead]);
   Object.keys(byStudentPhase).forEach(id => {
     const st = byStudent[id];
     Object.keys(byStudentPhase[id]).forEach(ph => {
@@ -1793,7 +1906,7 @@ function buildCSV(s) {
   {
     const T = analyzeTA(s);
     L.push("=== TA POSITION LOG ===");
-    row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Activity", "Place", "Table", "Seconds There", "X Within Area (0-1)", "Y Within Area (0-1)"]);
+    row(["#", "WallClockTime", "ElapsedSeconds", "Elapsed", "Problem Type", "Place", "Table", "Seconds There", "X Within Area (0-1)", "Y Within Area (0-1)"]);
     const marks = s.log.filter(e => e.kind === "ta");
     marks.forEach((m, i) => {
       const end = Math.min(i < marks.length - 1 ? marks[i + 1].elapsedSec : s.totalSeconds, roundEnd(s, segIndexOf(s, m)));
@@ -1802,18 +1915,19 @@ function buildCSV(s) {
     });
     L.push("");
 
-    L.push("=== TA TIME BY PLACE AND ACTIVITY TYPE ===");
-    row(["Activity", "Place", "Seconds", "% of Activity Time With TA Marked", "Visits"]);
+    L.push("=== TA TIME BY PLACE AND PROBLEM TYPE ===");
+    row(["Problem Type (of that table at the time)", "Place", "Seconds", "% of TA Time at Tables of This Type", "Visits"]);
     Object.keys(T.time).forEach(ph => {
-      [["front", "Front of room"], ...s.tables.map(t => [t.id, `Table ${t.id}`])].forEach(([k, lab]) => {
-        const sec = T.time[ph][k] || 0;
-        row([ph, lab, sec, pct(sec, T.phaseMarked[ph]).toFixed(1), (T.visits[ph] || {})[k] || 0]);
+      s.tables.forEach(t => {
+        const sec = T.time[ph][t.id] || 0;
+        row([ph, `Table ${t.id}`, sec, pct(sec, T.phaseMarked[ph]).toFixed(1), (T.visits[ph] || {})[t.id] || 0]);
       });
     });
+    row(["(any)", "Front of room", T.front.sec, "", T.front.visits]);
     L.push("");
 
     L.push("=== COLLABORATION WITH vs WITHOUT THE TA AT THE TABLE (student-chunks) ===");
-    row(["Activity", "Table", "TA Presence", ...codeCols, ...statHead]);
+    row(["Problem Type", "Table", "TA Presence", ...codeCols, ...statHead]);
     const presRow = (ph, tableLabel, w, b) =>
       row([ph, tableLabel, w === "with" ? "TA at table" : "TA elsewhere", ...CODES.map(c => b[c.key]), ...statCols(b)]);
     Object.keys(T.pres).forEach(ph => ["with", "without"].forEach(w => { if (T.pres[ph][w]) presRow(ph, "All", w, T.pres[ph][w]); }));
@@ -1876,6 +1990,8 @@ function tryResume() {
 
   obsSession = saved;
   if (!obsSession.chunks) { obsSession.chunks = []; obsSession.chunkSeq = 0; obsSession.chunkSec = CHUNK_SEC; }
+  if (!obsSession.typeLog) obsSession.typeLog = [];
+  obsSession.tables.forEach(t => { if (t.type == null) t.type = ""; });
   if (obsSession.timerRunning && obsSession.segmentStart) obsSession.accumMs += Date.now() - obsSession.segmentStart;
   obsSession.segmentStart = Date.now();
   obsSession.timerRunning = true;
